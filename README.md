@@ -126,12 +126,7 @@ python src/flink_jobs/price_prediction.py
    - Uses LSTM neural network
    - Requires 60 data points for initial prediction
    - Predicts price for the next hour
-   - Continuous learning mode:
-     - Initial training with 1-2 hours of data
-     - Retrains every 100 new data points
-     - Improves predictions over time
-     - Each retraining takes 1-2 minutes
-   - Reinforcement Learning mode (optional):
+   - Reinforcement Learning mode:
      - Learns through trading interactions
      - Adapts to market conditions
      - Makes trading decisions
@@ -184,10 +179,6 @@ make stop
 - Technical analysis is performed on 5-minute windows
 - Sentiment analysis is performed on all new Reddit posts
 - All data is processed in real-time using Kafka streams
-- Price prediction model improves continuously:
-  - Initial training: 1-2 hours of data
-  - Retraining: Every 100 new data points (~100 minutes)
-  - Each retraining takes 1-2 minutes
 - Reinforcement Learning mode:
   - Requires significant historical data for training
   - Adapts to changing market conditions

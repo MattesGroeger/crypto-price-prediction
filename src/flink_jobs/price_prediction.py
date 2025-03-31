@@ -7,6 +7,9 @@ from kafka import KafkaConsumer, KafkaProducer
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
+import time
+import os
+from tensorflow.keras.models import load_model
 
 # Configure logging
 logging.basicConfig(
@@ -22,6 +25,11 @@ class TradingEnvironment:
         self.positions: Dict[str, float] = {}  # Separate position for each symbol
         self.entry_prices: Dict[str, float] = {}  # Entry price for each position
         self.trades: Dict[str, List[Dict]] = {}  # Trade history for each symbol
+        self.max_position_size = 0.05  # 5% of balance
+        self.min_balance_ratio = 0.5  # Minimum balance ratio before stopping trading
+        self.trend_window = 5  # Number of periods to consider for trend
+        self.consecutive_losses: Dict[str, int] = {}  # Track consecutive losses for each symbol
+        self.max_consecutive_losses = 3  # Maximum consecutive losses before resetting
         
     def reset(self, symbol: str):
         """Reset environment for a specific symbol"""
@@ -29,6 +37,7 @@ class TradingEnvironment:
         self.positions[symbol] = 0.0
         self.entry_prices[symbol] = 0.0
         self.trades[symbol] = []
+        self.consecutive_losses[symbol] = 0
         
     def _get_state(self) -> np.ndarray:
         """Get current environment state"""
@@ -43,6 +52,14 @@ class TradingEnvironment:
             sum(1 for p in self.positions.values() if p > 0) / 3.0  # Number of long positions (normalized)
         ])
         
+    def _calculate_trend(self, symbol: str) -> float:
+        """Calculate price trend over the last few periods"""
+        if len(self.trades[symbol]) < self.trend_window:
+            return 0.0
+            
+        prices = [trade['price'] for trade in self.trades[symbol][-self.trend_window:]]
+        return (prices[-1] - prices[0]) / prices[0]
+        
     def step(self, action: int, price: float, symbol: str) -> Tuple[float, bool]:
         """Execute a trading action"""
         if symbol not in self.balances:
@@ -51,9 +68,30 @@ class TradingEnvironment:
         reward = 0.0
         done = False
         
-        # Calculate position size (max 10% of balance)
-        max_position = self.balances[symbol] * 0.1
+        # Check if balance is too low to continue trading
+        if self.balances[symbol] < self.initial_balance * self.min_balance_ratio:
+            logger.warning(f"Balance too low for {symbol}: {self.balances[symbol]:.2f}")
+            # Reset balance to initial value and continue trading
+            self.balances[symbol] = self.initial_balance
+            self.positions[symbol] = 0.0
+            self.entry_prices[symbol] = 0.0
+            logger.info(f"Reset balance for {symbol} to {self.initial_balance:.2f} and continuing trading")
+            return -0.1, False  # Penalty but don't stop trading
+            
+        # Check for consecutive losses
+        if self.consecutive_losses[symbol] >= self.max_consecutive_losses:
+            logger.warning(f"Too many consecutive losses for {symbol}: {self.consecutive_losses[symbol]}")
+            # Reset environment and continue trading
+            self.reset(symbol)
+            logger.info(f"Reset environment for {symbol} to recover from consecutive losses")
+            return -0.1, False  # Penalty but don't stop trading
+        
+        # Calculate position size (max 5% of balance)
+        max_position = self.balances[symbol] * self.max_position_size
         current_position = self.positions[symbol]
+        
+        # Calculate current trend
+        trend = self._calculate_trend(symbol)
         
         if action == 0:  # Sell
             if current_position > 0:
@@ -61,41 +99,63 @@ class TradingEnvironment:
                 pnl = (price - self.entry_prices[symbol]) * current_position
                 reward = pnl / self.initial_balance  # Normalize reward
                 
+                # Update consecutive losses counter
+                if pnl < 0:
+                    self.consecutive_losses[symbol] += 1
+                else:
+                    self.consecutive_losses[symbol] = 0
+                
                 # Update balance and close position
                 self.balances[symbol] += pnl
                 self.positions[symbol] = 0.0
                 self.entry_prices[symbol] = 0.0
                 
-                # Record trade
+                # Record trade with trend information
                 self.trades[symbol].append({
                     'action': 'sell',
                     'price': price,
                     'pnl': pnl,
-                    'balance': self.balances[symbol]
+                    'balance': self.balances[symbol],
+                    'timestamp': time.time(),
+                    'trend': trend,
+                    'reason': f"Trend: {trend:.4f}, PnL: {pnl:.2f}, Consecutive Losses: {self.consecutive_losses[symbol]}"
                 })
                 
         elif action == 2:  # Buy
             if current_position == 0:
+                # Only buy in uptrend
+                if trend < 0:
+                    logger.info(f"Not buying {symbol} in downtrend: {trend:.4f}")
+                    return 0.0, False
+                
                 # Calculate position size
-                position_size = min(max_position, self.balances[symbol] * 0.1)
+                position_size = min(max_position, self.balances[symbol] * self.max_position_size)
                 
                 # Update position and balance
                 self.positions[symbol] = position_size / price
                 self.balances[symbol] -= position_size
                 self.entry_prices[symbol] = price
                 
-                # Record trade
+                # Record trade with trend information
                 self.trades[symbol].append({
                     'action': 'buy',
                     'price': price,
                     'size': position_size,
-                    'balance': self.balances[symbol]
+                    'balance': self.balances[symbol],
+                    'timestamp': time.time(),
+                    'trend': trend,
+                    'reason': f"Trend: {trend:.4f}, Position Size: {position_size:.2f}, Consecutive Losses: {self.consecutive_losses[symbol]}"
                 })
                 
         # Calculate reward based on position value
         if current_position > 0:
             position_value = current_position * price
             reward = (position_value - (current_position * self.entry_prices[symbol])) / self.initial_balance
+            
+            # Add reward for holding profitable positions
+            if reward > 0:
+                reward += 0.001  # Small bonus for profitable holds
+                self.consecutive_losses[symbol] = 0  # Reset consecutive losses on profit
             
         return reward, done
 
@@ -124,6 +184,9 @@ class RLPricePredictionModel:
         self.win_rate = 0.0
         self.total_trades = 0
         self.winning_trades = 0
+        
+        # Try to load existing model
+        self._load_model()
         
         logger.info(f"Initialized model with window_size={window_size}")
         
@@ -263,6 +326,53 @@ class RLPricePredictionModel:
             'win_rate': float(self.win_rate)
         }
     
+    def _save_model(self):
+        """Save the model and training state"""
+        try:
+            # Save the model
+            self.model.save('models/trading_model.h5')
+            
+            # Save training state
+            state = {
+                'step_count': self.step_count,
+                'total_reward': self.total_reward,
+                'win_rate': self.win_rate,
+                'total_trades': self.total_trades,
+                'winning_trades': self.winning_trades,
+                'epsilon': self.epsilon
+            }
+            
+            with open('models/training_state.json', 'w') as f:
+                json.dump(state, f)
+                
+            logger.info("Model and training state saved successfully")
+            
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+            
+    def _load_model(self):
+        """Load existing model and training state if available"""
+        try:
+            # Try to load the model
+            if os.path.exists('models/trading_model.h5'):
+                self.model = load_model('models/trading_model.h5')
+                logger.info("Loaded existing model")
+                
+                # Try to load training state
+                if os.path.exists('models/training_state.json'):
+                    with open('models/training_state.json', 'r') as f:
+                        state = json.load(f)
+                        self.step_count = state['step_count']
+                        self.total_reward = state['total_reward']
+                        self.win_rate = state['win_rate']
+                        self.total_trades = state['total_trades']
+                        self.winning_trades = state['winning_trades']
+                        self.epsilon = state['epsilon']
+                    logger.info(f"Loaded training state: {state}")
+                    
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            
     def _train(self):
         """Train the model on a batch of experiences"""
         if len(self.training_data) < self.batch_size:
@@ -312,6 +422,9 @@ class RLPricePredictionModel:
             
             # Log training metrics
             logger.info(f"Training loss: {history.history['loss'][0]:.4f}")
+            
+            # Save model after training
+            self._save_model()
             
         except Exception as e:
             logger.error(f"Error during model training: {e}")

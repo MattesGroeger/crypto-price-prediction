@@ -126,12 +126,6 @@ python src/flink_jobs/price_prediction.py
    - Uses LSTM neural network
    - Requires 60 data points for initial prediction
    - Predicts price for the next hour
-   - Reinforcement Learning mode:
-     - Learns through trading interactions
-     - Adapts to market conditions
-     - Makes trading decisions
-     - Optimizes for profit/loss
-     - Requires longer training period
 
 ## Kafka Topics
 
@@ -179,11 +173,6 @@ make stop
 - Technical analysis is performed on 5-minute windows
 - Sentiment analysis is performed on all new Reddit posts
 - All data is processed in real-time using Kafka streams
-- Reinforcement Learning mode:
-  - Requires significant historical data for training
-  - Adapts to changing market conditions
-  - Can implement trading strategies
-  - Higher computational requirements
 
 ## Troubleshooting
 
